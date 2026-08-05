@@ -1,29 +1,26 @@
-import torch
-
-# Limitar hilos de CPU para no desbordar RAM
-torch.set_num_threads(1)
-
-# Asegurar consumo de memoria eficiente
-with torch.no_grad():
-    # ... aquí ejecutas la inferencia/predicción ...
-from fastapi import FastAPI
 import os
+import gc
 import pandas as pd
 import numpy as np
-from supabase import create_client
-from xgboost import XGBClassifier
 import torch
 import torch.nn as nn
+from fastapi import FastAPI
+from supabase import create_client
+from xgboost import XGBClassifier
 from sklearn.preprocessing import MinMaxScaler
+
+# --- OPTIMIZACIÓN DE MEMORIA RAM EN RENDER ---
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 app = FastAPI()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# --- Modelo PyTorch LSTM ---
+# --- Modelo PyTorch LSTM Ligero ---
 class CocoaLSTM(nn.Module):
-    def __init__(self, input_size=1, hidden_size=32, num_layers=1, output_size=5):
+    def __init__(self, input_size=1, hidden_size=16, num_layers=1, output_size=5):
         super(CocoaLSTM, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
@@ -44,8 +41,8 @@ def run_pipeline():
         
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # 1. Extracción de datos
-    res_daily = supabase.table("futures_daily").select("date, close_price, volume").order("date", desc=True).limit(1000).execute()
+    # 1. Extracción de datos (limitamos a 300 registros para ahorrar RAM)
+    res_daily = supabase.table("futures_daily").select("date, close_price, volume").order("date", desc=True).limit(300).execute()
     df_daily = pd.DataFrame(res_daily.data)
     df_daily['date'] = pd.to_datetime(df_daily['date'])
     df_daily = df_daily.sort_values('date', ascending=True).reset_index(drop=True)
@@ -68,7 +65,7 @@ def run_pipeline():
     X = df_xgb[features]
     y = df_xgb['target']
 
-    xgb_model = XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, random_state=42)
+    xgb_model = XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, random_state=42)
     xgb_model.fit(X, y)
 
     latest_data = X.iloc[[-1]]
@@ -92,7 +89,7 @@ def run_pipeline():
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled_prices = scaler.fit_transform(prices)
 
-    seq_length = 30
+    seq_length = 20
     X_lstm, y_lstm = [], []
     for i in range(len(scaled_prices) - seq_length - 5):
         X_lstm.append(scaled_prices[i : i + seq_length])
@@ -101,20 +98,21 @@ def run_pipeline():
     X_lstm = torch.tensor(np.array(X_lstm), dtype=torch.float32)
     y_lstm = torch.tensor(np.array(y_lstm), dtype=torch.float32)
 
-    lstm_model = CocoaLSTM(input_size=1, hidden_size=32, num_layers=1, output_size=5)
+    # LSTM ligera con hidden_size=16
+    lstm_model = CocoaLSTM(input_size=1, hidden_size=16, num_layers=1, output_size=5)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.01)
 
-    # Entrenamiento rápido en CPU (50 épocas)
-    for epoch in range(50):
-        lstm_model.train()
+    # Entrenamiento super ligero (20 épocas)
+    lstm_model.train()
+    for epoch in range(20):
         optimizer.zero_grad()
         outputs = lstm_model(X_lstm)
         loss = criterion(outputs, y_lstm)
         loss.backward()
         optimizer.step()
 
-    # Predicción a futuro
+    # Predicción a futuro sin guardar gradientes
     lstm_model.eval()
     last_seq = torch.tensor(scaled_prices[-seq_length:], dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
@@ -135,6 +133,10 @@ def run_pipeline():
         })
 
     supabase.table("price_forecasts").upsert(forecast_records, on_conflict="base_date,forecast_date").execute()
+
+    # === LIMPIEZA EXPLÍCITA DE MEMORIA RAM ===
+    del X_lstm, y_lstm, lstm_model, xgb_model, df_daily, df_xgb
+    gc.collect()
 
     return {
         "status": "success",
