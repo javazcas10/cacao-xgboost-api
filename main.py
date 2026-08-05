@@ -1,38 +1,19 @@
 import os
-import gc
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
 from fastapi import FastAPI
 from supabase import create_client
 from xgboost import XGBClassifier
-from sklearn.preprocessing import MinMaxScaler
-
-# --- OPTIMIZACIÓN DE MEMORIA RAM EN RENDER ---
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 app = FastAPI()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# --- Modelo PyTorch LSTM Ligero ---
-class CocoaLSTM(nn.Module):
-    def __init__(self, input_size=1, hidden_size=16, num_layers=1, output_size=5):
-        super(CocoaLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
-        
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
-        return out
-
 @app.get("/")
 def home():
-    return {"message": "API XGBoost + LSTM lista"}
+    return {"message": "API XGBoost + Forecast lista"}
 
 @app.get("/run-xgboost")
 def run_pipeline():
@@ -41,8 +22,8 @@ def run_pipeline():
         
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # 1. Extracción de datos (limitamos a 300 registros para ahorrar RAM)
-    res_daily = supabase.table("futures_daily").select("date, close_price, volume").order("date", desc=True).limit(300).execute()
+    # 1. Extracción de datos
+    res_daily = supabase.table("futures_daily").select("date, close_price, volume").order("date", desc=True).limit(500).execute()
     df_daily = pd.DataFrame(res_daily.data)
     df_daily['date'] = pd.to_datetime(df_daily['date'])
     df_daily = df_daily.sort_values('date', ascending=True).reset_index(drop=True)
@@ -84,41 +65,9 @@ def run_pipeline():
     }
     supabase.table("market_signals").upsert(signal_payload, on_conflict="signal_date").execute()
 
-    # ==================== 3. MODELO 2: LSTM (PROYECCIÓN 5 DÍAS) ====================
-    prices = df_daily['close_price'].values.reshape(-1, 1)
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_prices = scaler.fit_transform(prices)
-
-    seq_length = 20
-    X_lstm, y_lstm = [], []
-    for i in range(len(scaled_prices) - seq_length - 5):
-        X_lstm.append(scaled_prices[i : i + seq_length])
-        y_lstm.append(scaled_prices[i + seq_length : i + seq_length + 5].flatten())
-
-    X_lstm = torch.tensor(np.array(X_lstm), dtype=torch.float32)
-    y_lstm = torch.tensor(np.array(y_lstm), dtype=torch.float32)
-
-    # LSTM ligera con hidden_size=16
-    lstm_model = CocoaLSTM(input_size=1, hidden_size=16, num_layers=1, output_size=5)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.01)
-
-    # Entrenamiento super ligero (20 épocas)
-    lstm_model.train()
-    for epoch in range(20):
-        optimizer.zero_grad()
-        outputs = lstm_model(X_lstm)
-        loss = criterion(outputs, y_lstm)
-        loss.backward()
-        optimizer.step()
-
-    # Predicción a futuro sin guardar gradientes
-    lstm_model.eval()
-    last_seq = torch.tensor(scaled_prices[-seq_length:], dtype=torch.float32).unsqueeze(0)
-    with torch.no_grad():
-        forecast_scaled = lstm_model(last_seq).numpy().flatten()
-    
-    forecast_prices = scaler.inverse_transform(forecast_scaled.reshape(-1, 1)).flatten()
+    # ==================== 3. MODELO 2: FORECAST 5 DÍAS (Holt-Winters) ====================
+    model_hw = ExponentialSmoothing(df_daily['close_price'], trend='add', seasonal=None).fit()
+    forecast_prices = model_hw.forecast(5).values
 
     # Guardar los 5 días proyectados en Supabase
     forecast_records = []
@@ -133,10 +82,6 @@ def run_pipeline():
         })
 
     supabase.table("price_forecasts").upsert(forecast_records, on_conflict="base_date,forecast_date").execute()
-
-    # === LIMPIEZA EXPLÍCITA DE MEMORIA RAM ===
-    del X_lstm, y_lstm, lstm_model, xgb_model, df_daily, df_xgb
-    gc.collect()
 
     return {
         "status": "success",
