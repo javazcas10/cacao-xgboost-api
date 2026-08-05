@@ -1,3 +1,11 @@
+import torch
+
+# Limitar hilos de CPU para no desbordar RAM
+torch.set_num_threads(1)
+
+# Asegurar consumo de memoria eficiente
+with torch.no_grad():
+    # ... aquí ejecutas la inferencia/predicción ...
 from fastapi import FastAPI
 import os
 import pandas as pd
