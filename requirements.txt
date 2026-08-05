@@ -1,8 +1,8 @@
 fastapi
 uvicorn
-xgboost
 pandas
 numpy
-scikit-learn
 supabase
-torch
+xgboost
+scikit-learn
+statsmodels
