@@ -73,7 +73,7 @@ def run_pipeline():
     forecast_records = []
     base_date = pd.to_datetime(latest_date)
     for i, p in enumerate(forecast_prices):
-        future_date = (base_date + pd.BDay(i + 1)).strftime('%Y-%m-%d')
+        future_date = (base_date + pd.tseries.offsets.BDay(i + 1)).strftime('%Y-%m-%d')
         forecast_records.append({
             "base_date": latest_date,
             "forecast_date": future_date,
